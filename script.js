@@ -1,4 +1,7 @@
-// script.js (V5.1 - Focus on Legend and Logging)
+// script.js (V6.12 - Complete, Fix Line Highlight & Color Logic)
+
+// Strict mode helps catch common coding errors
+"use strict";
 
 // Ensure core libraries are loaded
 if (typeof deck === 'undefined' || (typeof maplibregl === 'undefined' && typeof mapboxgl === 'undefined')) {
@@ -7,11 +10,12 @@ if (typeof deck === 'undefined' || (typeof maplibregl === 'undefined' && typeof 
 }
 
 const mapLibrary = typeof maplibregl !== 'undefined' ? maplibregl : mapboxgl;
-const { GeoJsonLayer, IconLayer } = deck;
+const { GeoJsonLayer, IconLayer, PathLayer } = deck;
 
 // --- Configuration Constants ---
 const GEOJSON_PATH_TEMPLATE = 'shenzhen_h3_access_pandana_res{resolution}.geojson';
 const STATIONS_GEOJSON_PATH = 'shenzhen_subway_stations.geojson';
+const LINES_GEOJSON_PATH = 'shenzhen_metro_lines.geojson';
 const DEFAULT_H3_RESOLUTION = 7;
 const AVAILABLE_H3_RESOLUTIONS = [5, 6, 7, 8, 9, 10];
 const MAPTILER_API_KEY = 'k84VW61MLYmoOFVcnsZK';
@@ -46,41 +50,50 @@ const EMPHASIS_FACTOR = 2.3;
 const MIN_BAR_HEIGHT = 15;
 
 const STATIONS_ICON_URL = 'metro_icon.png';
-const STATIONS_ICON_MAPPING = { // Adjust width/height to your actual icon file dimensions
-    marker: { x: 0, y: 0, width: 280, height: 280, mask: false } // Example for a 128x128 icon
+// IMPORTANT: Replace 128, 128 with your metro_icon.png's actual pixel width and height
+const STATIONS_ICON_MAPPING = { marker: { x: 0, y: 0, width: 280, height: 280, mask: false } };
+const STATIONS_ICON_SIZE = 4;
+const STATIONS_ICON_MIN_SIZE_PIXELS = 16;
+const STATIONS_ICON_MAX_SIZE_PIXELS = 80;
+
+const METRO_LINE_WIDTH = 5;
+const METRO_LINE_HIGHLIGHT_COLOR = [255, 0, 255, 255]; // Magenta
+const DEFAULT_METRO_LINE_COLOR_RGB = [100, 100, 100];
+const METRO_LINE_COLOR_MAP = { // Example, use your actual line names and preferred colors
+    "1号线": [0, 153, 51],   "2号线": [243, 112, 33], "3号线": [0, 160, 220],
+    "4号线": [237, 28, 36],  "5号线": [126, 70, 151], "6号线": [0, 169, 157],
+    "7号线": [0, 84, 166],   "8号线": [243, 112, 33], // Often same as 2号线 or a variant
+    "9号线": [153, 153, 102],"10号线": [252, 175, 200],
+    "11号线": [102, 0, 102], "12号线": [0, 130, 123],
+    "14号线": [178, 178, 178],"16号线": [101, 194, 235],
+    "default": [128, 128, 128] // Fallback color for lines not in map
 };
-const STATIONS_ICON_SIZE = 4; // Base size in pixels
-const STATIONS_ICON_MIN_SIZE_PIXELS = 20; // Min size
-const STATIONS_ICON_MAX_SIZE_PIXELS = 96; // Max size
-const STATIONS_LAYER_HIGHLIGHT_COLOR = [0, 255, 255, 255];
 
 // DOM Element Cache
-let loaderElement, tooltipElement, legendDiv, mapContainerElement;
-let extrusionScaleSliderElement, extrusionScaleValueElement;
-let h3ResolutionSliderElement, h3ResolutionValueElement;
-let basemapSelectorElement;
-let toggleAccessibilityLayerCheckbox, toggleStationsLayerCheckbox;
+let domElements = {};
 
 // Map and Layer State
 let mapInstance;
-let deckOverlayInstance;
+let deckOverlayInstance = null;
 let currentExtrusionMultiplier = 1.0;
 let currentH3Data = null;
 let currentStationsData = null;
+let currentLinesData = null; // This will store the original FeatureCollection for lines
+let currentFlattenedLinesData = null; // This will store the array of LineString features for PathLayer
 let currentlyLoadedH3Resolution = null;
-let showAccessibilityLayer = true;
-let showStationsLayer = true;
-
+let showAccessibilityLayer, showStationsLayer, showMetroLinesLayer;
+let highlightedLineId = null; // Stores the _originalFeatureId of the highlighted line
 
 // --- Helper Functions ---
-function getColor(walkTimeMinutes) { /* ... (same as V5) ... */ 
+function getColor(walkTimeMinutes) {
     if (walkTimeMinutes === null || walkTimeMinutes === undefined || isNaN(walkTimeMinutes)) return NO_DATA_COLOR;
     for (const scale of COLOR_SCALE_CONFIG) {
         if (walkTimeMinutes <= scale.limit) return scale.color;
     }
     return COLOR_SCALE_CONFIG[COLOR_SCALE_CONFIG.length - 1].color;
 }
-function getElevation(walkTimeMinutes) { /* ... (same as V5) ... */
+
+function getElevation(walkTimeMinutes) {
     const baseMinHeight = MIN_BAR_HEIGHT;
     if (walkTimeMinutes === null || walkTimeMinutes === undefined || isNaN(walkTimeMinutes) || walkTimeMinutes < 0) {
         return baseMinHeight * currentExtrusionMultiplier;
@@ -89,22 +102,14 @@ function getElevation(walkTimeMinutes) { /* ... (same as V5) ... */
     if (walkTimeMinutes < MAX_WALK_TIME_FOR_LOWEST_HEIGHT && walkTimeMinutes > 0.01) {
         const timeRatio = walkTimeMinutes / MAX_WALK_TIME_FOR_LOWEST_HEIGHT;
         proportion = Math.pow(1 - timeRatio, EMPHASIS_FACTOR);
-    } else if (walkTimeMinutes <= 0.01) {
-        proportion = 1;
-    }
+    } else if (walkTimeMinutes <= 0.01) { proportion = 1; }
     proportion = Math.max(0, Math.min(proportion, 1));
     const calculatedHeight = proportion * MAX_ELEVATION_METERS + baseMinHeight;
     return calculatedHeight * currentExtrusionMultiplier;
 }
 
 function addLegend() {
-    // This function should be called AFTER legendDiv is confirmed to be valid in initializeMap
-    if (!legendDiv) {
-        console.error("FATAL: legendDiv is not defined when addLegend is called. This should not happen.");
-        return;
-    }
-    console.log("addLegend called. legendDiv found:", legendDiv); // Log to confirm it's called and div exists
-
+    if (!domElements.legend) { console.error("addLegend: legendDiv not found in domElements."); return; }
     let legendHTML = '<div class="legend-title">平均步行时间 (分钟)</div>';
     let lowerBound = 0;
     if (COLOR_SCALE_CONFIG && COLOR_SCALE_CONFIG.length > 0) {
@@ -115,15 +120,13 @@ function addLegend() {
         });
         const noDataCssColor = `rgba(${NO_DATA_COLOR[0]}, ${NO_DATA_COLOR[1]}, ${NO_DATA_COLOR[2]}, ${(NO_DATA_COLOR[3] / 255).toFixed(2)})`;
         legendHTML += `<div class="legend-item"><span class="legend-color-box" style="background-color:${noDataCssColor};"></span><span class="legend-text">无数据/不可达</span></div>`;
-        legendDiv.innerHTML = legendHTML;
-        console.log("Legend HTML generated and set.");
+        domElements.legend.innerHTML = legendHTML;
     } else {
-        console.error("COLOR_SCALE_CONFIG is empty or undefined. Cannot generate legend items.");
-        legendDiv.innerHTML = '<div class="legend-title">图例配置错误</div>';
+        domElements.legend.innerHTML = '<div class="legend-title">图例配置错误</div>';
     }
 }
 
-function createH3LayerInstance() { /* ... (same as V5) ... */
+function createH3LayerInstance() {
     if (!currentH3Data || !currentH3Data.features || currentH3Data.features.length === 0) return null;
     return new GeoJsonLayer({
         id: 'h3-accessibility-layer', data: currentH3Data, filled: true, extruded: true, wireframe: false,
@@ -131,167 +134,295 @@ function createH3LayerInstance() { /* ... (same as V5) ... */
         getElevation: d => getElevation(d.properties.avg_walk_time_min),
         elevationScale: 1.0, pickable: true, autoHighlight: true, highlightColor: [255, 255, 0, 180],
         onHover: info => {
-            if (!tooltipElement) return;
+            if (!domElements.tooltip) return;
             if (info.object) {
                 const props = info.object.properties;
-                tooltipElement.style.display = 'block';
-                tooltipElement.style.left = `${info.x + 10}px`;
-                tooltipElement.style.top = `${info.y + 10}px`;
+                domElements.tooltip.style.display = 'block';
+                domElements.tooltip.style.left = `${info.x + 10}px`;
+                domElements.tooltip.style.top = `${info.y + 10}px`;
                 let content = `<strong>H3 ID:</strong> ${props.h3_id}<br>`;
                 if (props.avg_walk_time_min !== null && props.avg_walk_time_min !== undefined) {
                     content += `<strong>平均步行时间:</strong> ${props.avg_walk_time_min.toFixed(1)} 分钟<br>`;
                     content += `<strong>平均步行距离:</strong> ${props.avg_dist_to_subway_m.toFixed(0)} 米`;
                 } else { content += "无此区域可达性数据"; }
-                tooltipElement.innerHTML = content;
-            } else { tooltipElement.style.display = 'none'; }
+                domElements.tooltip.innerHTML = content;
+            } else { domElements.tooltip.style.display = 'none'; }
         },
         updateTriggers: { getElevation: currentExtrusionMultiplier },
         visible: showAccessibilityLayer
     });
- }
-function createStationsLayerInstance() { /* ... (same as V4/V5) ... */
+}
+
+function createStationsLayerInstance() {
     if (!currentStationsData || !currentStationsData.features || currentStationsData.features.length === 0) return null;
     return new IconLayer({
-        id: 'subway-stations-layer',
-        data: currentStationsData.features, 
-        iconAtlas: STATIONS_ICON_URL,
-        iconMapping: STATIONS_ICON_MAPPING,
-        getIcon: d => 'marker',
+        id: 'subway-stations-layer', data: currentStationsData.features,
+        iconAtlas: STATIONS_ICON_URL, iconMapping: STATIONS_ICON_MAPPING, getIcon: d => 'marker',
         getPosition: d => d.geometry.coordinates,
-        sizeScale: 1,
-        getSize: d => STATIONS_ICON_SIZE,
-        sizeMinPixels: STATIONS_ICON_MIN_SIZE_PIXELS,
-        sizeMaxPixels: STATIONS_ICON_MAX_SIZE_PIXELS,
-        pickable: true,
-        autoHighlight: true, // autoHighlight for IconLayer might not change color, but can trigger hover
+        sizeScale: 1, getSize: STATIONS_ICON_SIZE,
+        sizeMinPixels: STATIONS_ICON_MIN_SIZE_PIXELS, sizeMaxPixels: STATIONS_ICON_MAX_SIZE_PIXELS,
+        pickable: true, autoHighlight: false,
         onHover: info => {
-            if (!tooltipElement) return;
-            if (info.object) { 
-                tooltipElement.style.display = 'block';
-                tooltipElement.style.left = `${info.x + 10}px`;
-                tooltipElement.style.top = `${info.y + 10}px`;
-                let stationName = "地铁站点";
-                if (info.object.properties) { 
-                    stationName = info.object.properties.name || info.object.properties.Name || stationName;
+            if (!domElements.tooltip) return;
+            if (info.object) {
+                domElements.tooltip.style.display = 'block';
+                domElements.tooltip.style.left = `${info.x + 10}px`;
+                domElements.tooltip.style.top = `${info.y + 10}px`;
+                let content = "<strong>地铁站点</strong><br>";
+                if (info.object.properties) {
+                    const props = info.object.properties;
+                    const primaryName = props.station_name_zh || props.name || props.Name || "未知站点";
+                    content = `<strong>${primaryName}</strong><br><hr style="margin: 3px 0;">`;
+                    for (const key in props) {
+                        if (props.hasOwnProperty(key) && !['station_name_zh', 'name', 'Name', 'geometry'].includes(key) && props[key] !== null && String(props[key]).trim() !== "") {
+                             content += `<span>${key}:</span> ${props[key]}<br>`;
+                        }
+                    }
                 }
-                tooltipElement.innerHTML = `<strong>${stationName}</strong>`;
-            } else { tooltipElement.style.display = 'none'; }
+                domElements.tooltip.innerHTML = content.replace(/<br>$/, ""); 
+            } else {
+                domElements.tooltip.style.display = 'none';
+            }
         },
         visible: showStationsLayer
     });
 }
 
-function updateDeckLayers() { /* ... (same as V5) ... */ 
-    if (!deckOverlayInstance) { console.warn("Deck overlay not initialized, cannot update layers."); return; }
+function isValidCoordinate(coord) {
+    return Array.isArray(coord) && coord.length >= 2 && typeof coord[0] === 'number' && typeof coord[1] === 'number' && !isNaN(coord[0]) && !isNaN(coord[1]);
+}
+function isValidLineStringCoordinates(coords) {
+    return Array.isArray(coords) && coords.length >= 2 && coords.every(isValidCoordinate);
+}
+function isValidMultiLineStringCoordinates(coords) {
+    return Array.isArray(coords) && coords.length > 0 && coords.every(isValidLineStringCoordinates);
+}
+
+function createMetroLinesLayerInstance() {
+    if (!currentFlattenedLinesData || currentFlattenedLinesData.length === 0) { // Use flattened data
+        return null;
+    }
+    // console.log(`createMetroLinesLayerInstance: Creating PathLayer with ${currentFlattenedLinesData.length} flattened features. Highlighted ID: ${highlightedLineId}`);
+
+    try {
+        return new PathLayer({
+            id: 'metro-lines-layer',
+            data: currentFlattenedLinesData, // Use the pre-processed flattened data
+            
+            getPath: feature => feature.geometry.coordinates,
+            
+            getColor: d => { // d is one of the flattenedFeatures
+                const currentFeatureOriginalId = d.properties._originalFeatureId;
+
+                if (highlightedLineId !== null && currentFeatureOriginalId === highlightedLineId) {
+                    return METRO_LINE_HIGHLIGHT_COLOR;
+                }
+                if (d.properties && d.properties.color) {
+                    const hexColor = d.properties.color;
+                    if (typeof hexColor === 'string' && hexColor.startsWith('#')) {
+                        try { 
+                            let r, g, b;
+                            if (hexColor.length === 7) {
+                                r = parseInt(hexColor.slice(1, 3), 16); g = parseInt(hexColor.slice(3, 5), 16); b = parseInt(hexColor.slice(5, 7), 16);
+                            } else if (hexColor.length === 4) {
+                                r = parseInt(hexColor.slice(1, 2).repeat(2), 16); g = parseInt(hexColor.slice(2, 3).repeat(2), 16); b = parseInt(hexColor.slice(3, 4).repeat(2), 16);
+                            } else { throw new Error("Invalid HEX"); }
+                            if (![r,g,b].some(isNaN)) return [r, g, b, ALPHA];
+                        } catch (e) { /* fallback */ }
+                    }
+                }
+                const lineName = d.properties.line_name || d.properties.name;
+                const mappedColor = lineName && METRO_LINE_COLOR_MAP[lineName];
+                const defaultColor = METRO_LINE_COLOR_MAP["default"] || DEFAULT_METRO_LINE_COLOR_RGB;
+                return mappedColor ? [...mappedColor, ALPHA] : [...defaultColor, ALPHA];
+            },
+            getWidth: METRO_LINE_WIDTH,
+            widthUnits: 'pixels',
+            widthMinPixels: 1,
+            jointRounded: true,
+            capRounded: true,
+            
+            pickable: true, 
+            autoHighlight: false,
+
+            onClick: (info) => { // info.object is a flattenedFeature
+                if (info.object && info.object.properties) {
+                    const clickedOriginalFeatureId = info.object.properties._originalFeatureId;
+                    
+                    highlightedLineId = (highlightedLineId === clickedOriginalFeatureId) ? null : clickedOriginalFeatureId;
+                    
+                    if (domElements.tooltip) {
+                        if (highlightedLineId !== null) {
+                            domElements.tooltip.style.display = 'block';
+                            domElements.tooltip.style.left = `${info.x + 10}px`;
+                            domElements.tooltip.style.top = `${info.y + 10}px`;
+                            domElements.tooltip.innerHTML = `<strong>线路: ${info.object.properties.line_name || info.object.properties.name || '未知线路'}</strong>`;
+                        } else {
+                            domElements.tooltip.style.display = 'none';
+                        }
+                    }
+                } else { 
+                    if (highlightedLineId !== null) highlightedLineId = null;
+                    if (domElements.tooltip) domElements.tooltip.style.display = 'none';
+                }
+                updateDeckLayers(); 
+            },
+            updateTriggers: {
+                getColor: highlightedLineId 
+            },
+            visible: showMetroLinesLayer
+        });
+    } catch (error) {
+        console.error("FATAL ERROR during PathLayer instantiation (with flattened data):", error);
+        return null;
+    }
+}
+
+function updateDeckLayers() {
+    if (!deckOverlayInstance) { return; }
     const layers = [];
     const h3Layer = createH3LayerInstance();
     const stationsLayer = createStationsLayerInstance();
+    const linesLayer = createMetroLinesLayerInstance();
+
     if (h3Layer) layers.push(h3Layer);
     if (stationsLayer) layers.push(stationsLayer);
+    if (linesLayer) layers.push(linesLayer);
+    
     deckOverlayInstance.setProps({ layers });
+    // console.log(`Deck layers updated. Total: ${layers.length}. H3:${showAccessibilityLayer}, Stn:${showStationsLayer}, Lines:${showMetroLinesLayer}`);
 }
 
-function addDeckOverlayToMap() { /* ... (same as V5) ... */
-    if (!mapInstance) { console.error("Map instance not available for Deck overlay."); return; }
-    if (deckOverlayInstance) {
-        try { mapInstance.removeControl(deckOverlayInstance); console.log("Old overlay removed.");}
-        catch (e) { console.warn("Could not remove old Deck.gl overlay:", e); }
+function setupDeckGLAndLoadData() {
+    if (!mapInstance || !domElements.h3ResolutionSlider) { return; }
+    if (deckOverlayInstance && typeof mapInstance.hasControl === 'function' && mapInstance.hasControl(deckOverlayInstance)) {
+        try { mapInstance.removeControl(deckOverlayInstance); } catch (e) { /* ignore */ }
     }
-    const MapboxOverlayClass = deck.MapboxOverlay;
-    if (!MapboxOverlayClass) { console.error("MapboxOverlay class not found in Deck.gl."); return; }
-
-    deckOverlayInstance = new MapboxOverlayClass({
-        layers: [], interleaved: true,
-        onError: (error, layer) => {
-            console.error('Deck.gl Overlay Error:', error, 'Layer ID:', layer ? layer.id : 'N/A');
-            if(loaderElement) loaderElement.classList.add('hidden');
+    deckOverlayInstance = null; 
+    deckOverlayInstance = new deck.MapboxOverlay({ layers: [], interleaved: true, 
+        onError: (e, layer) => { 
+            console.error('Deck.gl Overlay Error:', e, 'Layer ID:', layer ? layer.id : 'N/A'); 
+            if(domElements.loader) domElements.loader.classList.add('hidden');
         }
     });
     mapInstance.addControl(deckOverlayInstance);
-    console.log("Deck.gl MapboxOverlay (re)added to map.");
     updateDeckLayers(); 
-    if (!currentH3Data) {
-        const initialEffectiveRes = getEffectiveH3Resolution(parseFloat(h3ResolutionSliderElement.value));
-        loadAndRenderH3Data(initialEffectiveRes);
-    }
-    if (!currentStationsData) {
-        loadStationsData();
-    }
+    const initialEffectiveRes = getEffectiveH3Resolution(parseFloat(domElements.h3ResolutionSlider.value));
+    loadAndRenderH3Data(initialEffectiveRes);
+    loadStationsData();
+    loadMetroLinesData(); // This will load original lines data and then process it
 }
 
-function loadAndRenderH3Data(resolutionToLoad) { /* ... (same as V5) ... */
-    if (!loaderElement) { console.error("Loader not ready for H3 data."); return; }
+function loadAndRenderH3Data(resolutionToLoad) {
+    if (!domElements.loader) { return; }
     if (!AVAILABLE_H3_RESOLUTIONS.includes(resolutionToLoad)) {
-        console.error(`Attempt to load unsupported H3 resolution: ${resolutionToLoad}.`); return;
+        currentH3Data = null; updateDeckLayers(); return; 
     }
     const geojsonPath = GEOJSON_PATH_TEMPLATE.replace('{resolution}', resolutionToLoad);
-    console.log(`Loading H3 data for res ${resolutionToLoad} from: ${geojsonPath}`);
-    loaderElement.classList.remove('hidden');
+    domElements.loader.classList.remove('hidden');
     currentlyLoadedH3Resolution = resolutionToLoad;
-
     fetch(geojsonPath)
         .then(response => {
-            if (!response.ok) throw new Error(`HTTP error! Status: ${response.status} for ${geojsonPath}`);
+            if (!response.ok) throw new Error(`HTTP ${response.status} for H3: ${geojsonPath}`);
             return response.json();
         })
-        .then(geojsonData => {
-            console.log(`H3 GeoJSON for res ${resolutionToLoad} parsed.`);
-            currentH3Data = (geojsonData && geojsonData.features && geojsonData.features.length > 0) ? geojsonData : null;
-            if (!currentH3Data) console.warn(`H3 GeoJSON for res ${resolutionToLoad} is empty or invalid.`);
-            updateDeckLayers(); 
-        })
-        .catch(error => {
-            console.error(`Error loading/processing H3 GeoJSON for res ${resolutionToLoad}:`, error);
-            currentH3Data = null;
-            updateDeckLayers(); 
-        })
-        .finally(() => { if(loaderElement) loaderElement.classList.add('hidden'); });
- }
-function loadStationsData() { /* ... (same as V5) ... */
-    if (!loaderElement) { console.error("Loader not ready for stations data."); return; }
-    console.log(`Loading subway stations data from: ${STATIONS_GEOJSON_PATH}`);
-    loaderElement.classList.remove('hidden');
+        .then(geojsonData => { currentH3Data = (geojsonData?.features?.length > 0) ? geojsonData : null; })
+        .catch(error => { console.error(`Error H3 (res ${resolutionToLoad}):`, error); currentH3Data = null; })
+        .finally(() => { updateDeckLayers(); if(domElements.loader) domElements.loader.classList.add('hidden'); });
+}
 
+function loadStationsData() {
+    if (!domElements.loader) { return; }
+    domElements.loader.classList.remove('hidden');
     fetch(STATIONS_GEOJSON_PATH)
         .then(response => {
-            if (!response.ok) throw new Error(`HTTP error! Status: ${response.status} for ${STATIONS_GEOJSON_PATH}`);
+            if (!response.ok) throw new Error(`HTTP ${response.status} for Stations: ${STATIONS_GEOJSON_PATH}`);
+            return response.json();
+        })
+        .then(geojsonData => { currentStationsData = (geojsonData?.features?.length > 0) ? geojsonData : null; })
+        .catch(error => { console.error(`Error Stations:`, error); currentStationsData = null; })
+        .finally(() => { updateDeckLayers(); if(domElements.loader) domElements.loader.classList.add('hidden'); });
+}
+
+function processAndStoreLinesData(originalLinesData) {
+    if (!originalLinesData || !originalLinesData.features || originalLinesData.features.length === 0) {
+        currentFlattenedLinesData = [];
+        console.warn("processAndStoreLinesData: Original lines data is empty or invalid.");
+        return;
+    }
+    const flattened = [];
+    originalLinesData.features.forEach((feature, featureIndex) => {
+        if (!feature || !feature.geometry || !feature.geometry.coordinates) return;
+        const type = feature.geometry.type;
+        const coords = feature.geometry.coordinates;
+        const properties = feature.properties || {};
+        const originalFeatureIdentifier = properties.line_name || properties.name || properties.id || properties.OBJECTID || featureIndex;
+
+        if (type === "LineString") {
+            if (isValidLineStringCoordinates(coords)) {
+                flattened.push({ ...feature, properties: {...properties, _originalFeatureId: originalFeatureIdentifier} });
+            }
+        } else if (type === "MultiLineString") {
+            if (isValidMultiLineStringCoordinates(coords)) {
+                coords.forEach((lineSegmentCoords) => {
+                    if (isValidLineStringCoordinates(lineSegmentCoords)) {
+                        flattened.push({
+                            type: "Feature",
+                            properties: { ...properties, _originalFeatureId: originalFeatureIdentifier },
+                            geometry: { type: "LineString", coordinates: lineSegmentCoords }
+                        });
+                    }
+                });
+            }
+        }
+    });
+    currentFlattenedLinesData = flattened;
+    console.log(`Lines data processed: ${originalLinesData.features.length} original -> ${flattened.length} flattened LineString features.`);
+}
+
+
+function loadMetroLinesData() {
+    if (!domElements.loader) { return; }
+    domElements.loader.classList.remove('hidden');
+    fetch(LINES_GEOJSON_PATH)
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP ${response.status} for Lines: ${LINES_GEOJSON_PATH}`);
             return response.json();
         })
         .then(geojsonData => {
-            console.log("Subway stations GeoJSON parsed.");
-            currentStationsData = (geojsonData && geojsonData.features && geojsonData.features.length > 0) ? geojsonData : null;
-            if (!currentStationsData) console.warn("Subway stations GeoJSON data is empty or invalid.");
-            updateDeckLayers(); 
+            currentLinesData = (geojsonData?.features?.length > 0) ? geojsonData : null; // Store original
+            processAndStoreLinesData(currentLinesData); // Process and store flattened
         })
-        .catch(error => {
-            console.error("Error loading/processing subway stations GeoJSON:", error);
-            currentStationsData = null;
-            updateDeckLayers(); 
+        .catch(error => { 
+            console.error(`Error Lines:`, error); 
+            currentLinesData = null; 
+            currentFlattenedLinesData = null;
         })
-        .finally(() => { if(loaderElement) loaderElement.classList.add('hidden'); });
+        .finally(() => { updateDeckLayers(); if(domElements.loader) domElements.loader.classList.add('hidden'); });
 }
-function getEffectiveH3Resolution(sliderValue) { /* ... (same as V4/V5) ... */ 
+
+function getEffectiveH3Resolution(sliderValue) {
+    if (isNaN(sliderValue) || sliderValue === undefined || sliderValue === null) return DEFAULT_H3_RESOLUTION;
     let roundedRes = Math.round(sliderValue);
     roundedRes = Math.max(AVAILABLE_H3_RESOLUTIONS[0], Math.min(roundedRes, AVAILABLE_H3_RESOLUTIONS[AVAILABLE_H3_RESOLUTIONS.length - 1]));
     if (!AVAILABLE_H3_RESOLUTIONS.includes(roundedRes)) {
         let closest = AVAILABLE_H3_RESOLUTIONS[0];
         let minDist = Math.abs(roundedRes - closest);
-        for (let i = 1; i < AVAILABLE_H3_RESOLUTIONS.length; i++) {
-            const dist = Math.abs(roundedRes - AVAILABLE_H3_RESOLUTIONS[i]);
-            if (dist < minDist) { minDist = dist; closest = AVAILABLE_H3_RESOLUTIONS[i];}
-        }
+        AVAILABLE_H3_RESOLUTIONS.forEach(res => {
+            const dist = Math.abs(roundedRes - res);
+            if (dist < minDist) { minDist = dist; closest = res; }
+        });
         roundedRes = closest;
     }
     return roundedRes;
 }
 
-function initializeMap() {
-    console.log("DOM fully loaded. Initializing map...");
-    // DOM Element Caching
-    const DOMElements = {
+function initializeDOMAndListeners() {
+    // console.log("DOM: Caching elements and attaching listeners...");
+    domElements = {
         loader: document.getElementById('loader'),
         tooltip: document.getElementById('tooltip'),
-        legend: document.getElementById('legend'), // Ensure this ID matches HTML
+        legend: document.getElementById('legend'),
         mapContainer: document.getElementById('map-container'),
         extrusionScaleSlider: document.getElementById('extrusion-scale-slider'),
         extrusionScaleValue: document.getElementById('extrusion-scale-value'),
@@ -299,124 +430,101 @@ function initializeMap() {
         h3ResolutionValue: document.getElementById('h3-resolution-value'),
         basemapSelector: document.getElementById('basemap-selector'),
         toggleAccessibilityLayer: document.getElementById('toggle-accessibility-layer'),
-        toggleStationsLayer: document.getElementById('toggle-stations-layer')
+        toggleStationsLayer: document.getElementById('toggle-stations-layer'),
+        toggleLinesLayer: document.getElementById('toggle-lines-layer')
     };
 
-    let allElementsFound = true;
-    for (const key in DOMElements) {
-        if (!DOMElements[key]) {
-            console.error(`CRITICAL: DOM element for '${key}' (ID: ${DOMElements[key]?.id || document.getElementById(key)?.id || 'unknown'}) not found.`);
-            allElementsFound = false;
-        }
+    const missing = Object.keys(domElements).filter(key => !domElements[key]);
+    if (missing.length > 0) {
+        const errorMsg = `HTML Error: Missing elements: ${missing.join(', ')}. Check IDs.`;
+        console.error(errorMsg); alert(errorMsg);
+        if (domElements.mapContainer) domElements.mapContainer.innerHTML = `<div style='color:red;padding:20px;'>${errorMsg}</div>`;
+        return false;
     }
-    if (!allElementsFound) {
-        alert("页面初始化错误：一个或多个必要的页面组件未找到。请检查HTML ID和浏览器控制台。");
-        return;
-    }
-    // Assign to global variables
-    loaderElement = DOMElements.loader;
-    tooltipElement = DOMElements.tooltip;
-    legendDiv = DOMElements.legend; // legendDiv is now assigned here
-    mapContainerElement = DOMElements.mapContainer;
-    extrusionScaleSliderElement = DOMElements.extrusionScaleSlider;
-    extrusionScaleValueElement = DOMElements.extrusionScaleValue;
-    h3ResolutionSliderElement = DOMElements.h3ResolutionSlider;
-    h3ResolutionValueElement = DOMElements.h3ResolutionValue;
-    basemapSelectorElement = DOMElements.basemapSelector;
-    toggleAccessibilityLayerCheckbox = DOMElements.toggleAccessibilityLayer;
-    toggleStationsLayerCheckbox = DOMElements.toggleStationsLayer;
 
-    // Initialize visibility states AFTER DOM elements are confirmed
-    showAccessibilityLayer = toggleAccessibilityLayerCheckbox.checked;
-    showStationsLayer = toggleStationsLayerCheckbox.checked;
+    showAccessibilityLayer = domElements.toggleAccessibilityLayer.checked;
+    showStationsLayer = domElements.toggleStationsLayer.checked;
+    showMetroLinesLayer = domElements.toggleLinesLayer.checked;
 
-    // Event Listeners (same as V5)
-    toggleAccessibilityLayerCheckbox.addEventListener('change', (event) => { /* ... updateDeckLayers() */ 
-        showAccessibilityLayer = event.target.checked;
-        console.log("Accessibility layer visibility changed to:", showAccessibilityLayer);
+    domElements.toggleAccessibilityLayer.addEventListener('change', e => { showAccessibilityLayer = e.target.checked; updateDeckLayers(); });
+    domElements.toggleStationsLayer.addEventListener('change', e => { showStationsLayer = e.target.checked; updateDeckLayers(); });
+    domElements.toggleLinesLayer.addEventListener('change', e => { showMetroLinesLayer = e.target.checked; updateDeckLayers(); });
+
+    domElements.extrusionScaleSlider.addEventListener('input', e => {
+        currentExtrusionMultiplier = parseFloat(e.target.value);
+        domElements.extrusionScaleValue.textContent = `${currentExtrusionMultiplier.toFixed(1)}x`;
         updateDeckLayers();
     });
-    toggleStationsLayerCheckbox.addEventListener('change', (event) => { /* ... updateDeckLayers() */ 
-        showStationsLayer = event.target.checked;
-        console.log("Stations layer visibility changed to:", showStationsLayer);
-        updateDeckLayers();
-    });
-    extrusionScaleSliderElement.addEventListener('input', (event) => { /* ... updateDeckLayers() */
-        currentExtrusionMultiplier = parseFloat(event.target.value);
-        extrusionScaleValueElement.textContent = `${currentExtrusionMultiplier.toFixed(1)}x`;
-        updateDeckLayers();
-     });
-    extrusionScaleValueElement.textContent = `${parseFloat(extrusionScaleSliderElement.value).toFixed(1)}x`;
-    currentExtrusionMultiplier = parseFloat(extrusionScaleSliderElement.value);
+    domElements.extrusionScaleValue.textContent = `${parseFloat(domElements.extrusionScaleSlider.value).toFixed(1)}x`;
+    currentExtrusionMultiplier = parseFloat(domElements.extrusionScaleSlider.value);
 
-    h3ResolutionSliderElement.addEventListener('input', (event) => { /* ... loadAndRenderH3Data() -> updateDeckLayers() */
-        const sliderRawValue = parseFloat(event.target.value);
-        const effectiveRes = getEffectiveH3Resolution(sliderRawValue);
-        h3ResolutionValueElement.textContent = effectiveRes;
+    domElements.h3ResolutionSlider.addEventListener('input', e => {
+        const effectiveRes = getEffectiveH3Resolution(parseFloat(e.target.value));
+        domElements.h3ResolutionValue.textContent = effectiveRes;
         if (effectiveRes !== currentlyLoadedH3Resolution) {
             currentH3Data = null; 
             updateDeckLayers(); 
             loadAndRenderH3Data(effectiveRes);
         }
     });
-    const initialSliderValue = parseFloat(h3ResolutionSliderElement.value);
-    const initialEffectiveRes = getEffectiveH3Resolution(initialSliderValue);
-    h3ResolutionValueElement.textContent = initialEffectiveRes;
+    domElements.h3ResolutionValue.textContent = getEffectiveH3Resolution(parseFloat(domElements.h3ResolutionSlider.value));
     
-    basemapSelectorElement.addEventListener('change', (event) => { /* ... addDeckOverlayToMap() */ 
-        const selectedBasemapId = event.target.value;
-        const styleUrl = BASEMAP_STYLES[selectedBasemapId];
+    domElements.basemapSelector.addEventListener('change', e => {
+        const styleUrl = BASEMAP_STYLES[e.target.value];
         if (mapInstance && styleUrl) {
-            console.log(`Changing basemap to: ${selectedBasemapId}`);
             const {lng, lat} = mapInstance.getCenter(); 
-            const zoom = mapInstance.getZoom();
-            const pitch = mapInstance.getPitch();
-            const bearing = mapInstance.getBearing();
+            const zoom = mapInstance.getZoom(), pitch = mapInstance.getPitch(), bearing = mapInstance.getBearing();
             mapInstance.setStyle(styleUrl); 
-            mapInstance.once('styledata', () => { 
-                console.log("New basemap style loaded. Restoring view & DeckGL overlay.");
+            mapInstance.once('load', () => { 
                 mapInstance.setCenter([lng, lat]); 
-                mapInstance.setZoom(zoom);
-                mapInstance.setPitch(pitch);
-                mapInstance.setBearing(bearing);
-                addDeckOverlayToMap(); 
+                mapInstance.setZoom(zoom); mapInstance.setPitch(pitch); mapInstance.setBearing(bearing);
+                // The map's primary 'load' event handler will call setupDeckGLAndLoadData
             });
-        } else { console.error(`Invalid basemap ID or style URL for: ${selectedBasemapId}`);}
+        }
     });
+    // console.log("DOM: Elements cached, listeners attached.");
+    return true;
+}
 
-    // Initialize Map Instance
-    const initialMapStyleUrl = BASEMAP_STYLES[DEFAULT_BASEMAP_ID];
+function initializeApp() {
+    console.log("App: Initializing...");
+    if (!initializeDOMAndListeners()) {
+        console.error("App: DOM initialization failed. Aborting.");
+        return;
+    }
+
     try {
         mapInstance = new mapLibrary.Map({
-            container: mapContainerElement, style: initialMapStyleUrl,
+            container: domElements.mapContainer, style: BASEMAP_STYLES[DEFAULT_BASEMAP_ID],
             center: [INITIAL_VIEW_STATE.longitude, INITIAL_VIEW_STATE.latitude],
             zoom: INITIAL_VIEW_STATE.zoom, pitch: INITIAL_VIEW_STATE.pitch, bearing: INITIAL_VIEW_STATE.bearing,
             interactive: true, minZoom: INITIAL_VIEW_STATE.minZoom, maxZoom: INITIAL_VIEW_STATE.maxZoom
          });
-        console.log("MapLibre/Mapbox GL JS map instance created.");
-    } catch (mapError) { /* ... (error handling) ... */ return; }
+        console.log("App: Map instance created.");
+    } catch (mapError) {
+        console.error("App: Failed to initialize base map:", mapError);
+        if(domElements.loader) domElements.loader.classList.add('hidden');
+        alert(`底图初始化失败: ${mapError.message}.`);
+        return;
+    }
 
     mapInstance.on('load', () => {
-        console.log("Base map 'load' event. Initializing Deck.gl overlay and loading initial data.");
-        addDeckOverlayToMap(); 
-        
-        // Crucially, call addLegend() AFTER legendDiv is confirmed to be valid and map is loaded
-        if (legendDiv) { // Double check legendDiv before calling
-            addLegend();
-        } else {
-            console.error("legendDiv is still not available when map loaded. Cannot add legend.");
-        }
-        
-        if (!currentStationsData) {
-            console.log("Base map loaded, triggering stations data load explicitly.");
-            loadStationsData();
-        }
+        console.log("Map 'load' event. Setting up Deck.gl and loading data.");
+        setupDeckGLAndLoadData(); 
+        if (domElements.legend) addLegend(); else console.error("Legend div not ready for addLegend.");
     });
-    mapInstance.on('error', (e) => { /* ... (error handling) ... */ });
+    mapInstance.on('error', e => { 
+        console.error("MapLibre/Mapbox GL JS map error event:", e.error ? e.error.message : e);
+        if (e.error?.message?.toLowerCase().includes("webgl")) {
+            alert("WebGL初始化失败。请确保您的浏览器支持WebGL并且已启用。");
+        }
+        if(domElements.loader) domElements.loader.classList.add('hidden');
+     });
 }
 
+// Start the application
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initializeMap);
+    document.addEventListener('DOMContentLoaded', initializeApp);
 } else {
-    initializeMap();
+    initializeApp();
 }
